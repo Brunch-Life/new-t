@@ -1,0 +1,16 @@
+# Scraped data (potentially large)
+scraped_data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment / secrets
+.env
+*.env
