@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Web scraper for https://new-t.github.io/
-Continuously scrapes content, structure, and all images (including external ones like risu.io).
+新T树洞 (New T Hole) scraper.
+Continuously fetches all posts, comments, and images via the REST API.
+
+Backend API: https://api.tholeapis.top/_api/v1/
+Auth: User-Token header
 """
 
 import os
@@ -18,32 +21,15 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
 
 import requests
-from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-BASE_URL = "https://new-t.github.io/"
-DEFAULT_INTERVAL = 300  # seconds between scrape cycles
+API_BASE = "https://api.tholeapis.top/_api/v1"
+API_BASE_V2 = "https://api.tholeapis.top/_api/v2"
+DEFAULT_INTERVAL = 300  # seconds between full scrape cycles
 OUTPUT_DIR = Path("scraped_data")
-IMAGES_DIR = OUTPUT_DIR / "images"
-PAGES_DIR = OUTPUT_DIR / "pages"
-HISTORY_DIR = OUTPUT_DIR / "history"
-SNAPSHOT_FILE = OUTPUT_DIR / "latest_snapshot.json"
-CHANGE_LOG = OUTPUT_DIR / "changelog.json"
-
-# Domains from which we also download images
-IMAGE_DOMAINS_ALLOWLIST = [
-    "new-t.github.io",
-    "risu.io",
-    "raw.githubusercontent.com",
-    "githubusercontent.com",
-    "i.imgur.com",
-    "imgur.com",
-    "cdn.discordapp.com",
-    "media.discordapp.net",
-]
 
 HEADERS = {
     "User-Agent": (
@@ -51,8 +37,7 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,ja;q=0.6",
+    "Accept": "application/json, text/plain, */*",
 }
 
 REQUEST_TIMEOUT = 30
@@ -70,569 +55,494 @@ log = logging.getLogger("scraper")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def ensure_dirs():
-    for d in [OUTPUT_DIR, IMAGES_DIR, PAGES_DIR, HISTORY_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def safe_filename(url: str) -> str:
-    """Convert a URL into a safe local filename while keeping the extension."""
-    parsed = urlparse(url)
-    path = unquote(parsed.path).strip("/")
-    if not path:
-        path = "index"
-    # Replace path separators and special chars
-    safe = re.sub(r'[^\w.\-]', '_', path)
-    # Truncate if too long
-    if len(safe) > 180:
-        safe = safe[:150] + "_" + sha256(url.encode())[:16]
+def safe_filename(name: str, max_len: int = 200) -> str:
+    safe = re.sub(r'[^\w.\-]', '_', name)
+    if len(safe) > max_len:
+        safe = safe[:max_len - 17] + "_" + hashlib.md5(name.encode()).hexdigest()[:16]
     return safe
 
 
-def image_local_path(url: str) -> Path:
-    """Determine local path for an image based on its URL."""
-    parsed = urlparse(url)
-    domain = parsed.netloc.replace(":", "_")
-    domain_dir = IMAGES_DIR / domain
-    domain_dir.mkdir(parents=True, exist_ok=True)
-    fname = safe_filename(url)
-    return domain_dir / fname
-
-
-def is_allowed_image_domain(url: str) -> bool:
-    """Check whether we should download images from this domain."""
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    # Always allow relative URLs (same domain)
-    if not host:
-        return True
-    return any(host == d or host.endswith("." + d) for d in IMAGE_DOMAINS_ALLOWLIST)
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def ensure_dirs(base: Path):
+    for sub in ["posts", "images", "history"]:
+        (base / sub).mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# Session builder
+# API client
 # ---------------------------------------------------------------------------
 
-def build_session(token: str) -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
+class HoleClient:
+    """Client for the 新T树洞 REST API."""
 
-    # Try multiple authentication approaches
-    # GitHub Pages private repos sometimes use a cookie or query param
-    s.cookies.set("token", token)
-    s.cookies.set("access_token", token)
-    s.headers["Authorization"] = f"Bearer {token}"
-    s.headers["X-Access-Token"] = token
+    def __init__(self, token: str, api_base: str = API_BASE):
+        self.token = token
+        self.api_base = api_base.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.session.headers["User-Token"] = token
 
-    return s
-
-
-# ---------------------------------------------------------------------------
-# Fetch helpers
-# ---------------------------------------------------------------------------
-
-def fetch_page(session: requests.Session, url: str, token: str) -> requests.Response | None:
-    """Fetch a page, trying multiple auth strategies."""
-    strategies = [
-        ("cookies+bearer (session default)", lambda u: session.get(u, timeout=REQUEST_TIMEOUT)),
-        ("?token= query param",              lambda u: session.get(u, params={"token": token}, timeout=REQUEST_TIMEOUT)),
-        ("?access_token= query param",       lambda u: session.get(u, params={"access_token": token}, timeout=REQUEST_TIMEOUT)),
-        ("X-Auth-Token header",              lambda u: session.get(u, headers={"X-Auth-Token": token}, timeout=REQUEST_TIMEOUT)),
-        ("HTTP Basic auth",                  lambda u: session.get(u, auth=("", token), timeout=REQUEST_TIMEOUT)),
-    ]
-
-    last_status = None
-    last_body = ""
-    for name, strategy in strategies:
+    def _get(self, endpoint: str, params: dict | None = None) -> dict | None:
+        url = f"{self.api_base}/{endpoint.lstrip('/')}"
         try:
-            resp = strategy(url)
-            last_status = resp.status_code
-            last_body = resp.text[:200]
-            if resp.status_code == 200:
-                log.info(f"Auth OK ({name}): {url}")
-                return resp
-            log.debug(f"Auth [{name}] -> {resp.status_code}: {resp.text[:120]}")
+            resp = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 401:
+                log.error(f"Token invalid or expired (401): {url}")
+                return None
+            if resp.status_code != 200:
+                log.warning(f"GET {url} -> {resp.status_code}: {resp.text[:200]}")
+                return None
+            return resp.json()
         except requests.RequestException as e:
-            log.debug(f"Auth [{name}] error: {e}")
+            log.error(f"Request error GET {url}: {e}")
+            return None
+        except ValueError as e:
+            log.error(f"JSON decode error for {url}: {e}")
+            return None
 
-    # Last resort: try without any auth
-    try:
-        clean_session = requests.Session()
-        clean_session.headers.update(HEADERS)
-        resp = clean_session.get(url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            log.info(f"Unauthenticated request succeeded for {url}")
-            return resp
-        last_status = resp.status_code
-        last_body = resp.text[:200]
-    except requests.RequestException as e:
-        log.debug(f"Unauthenticated request failed: {e}")
+    def get_list(self, page: int = 1, order_mode: int = 0, room_id: int | None = None) -> dict | None:
+        """Fetch paginated post list (25 per page)."""
+        params = {"p": page, "order_mode": order_mode}
+        if room_id is not None:
+            params["room_id"] = room_id
+        return self._get("getlist", params)
 
-    log.error(f"All auth strategies failed for {url} (last status={last_status}, body={last_body!r})")
-    return None
+    def get_one(self, pid: int) -> dict | None:
+        """Fetch a single post by ID."""
+        return self._get("getone", {"pid": pid})
+
+    def get_comments(self, pid: int) -> dict | None:
+        """Fetch comments for a post."""
+        return self._get("getcomment", {"pid": pid})
+
+    def get_attention(self) -> dict | None:
+        """Fetch user's followed posts."""
+        return self._get("getattention")
+
+    def search(self, keywords: str, page: int = 1, search_mode: int = 0) -> dict | None:
+        """Search posts."""
+        return self._get("search", {
+            "keywords": keywords,
+            "page": page,
+            "search_mode": search_mode,
+        })
+
+    def get_multi(self, pids: list[int]) -> dict | None:
+        """Fetch multiple posts by IDs."""
+        return self._get("getmulti", {"pids": ",".join(str(p) for p in pids)})
+
+    def get_system_msg(self) -> dict | None:
+        """Fetch system messages."""
+        return self._get("/system_msg")
 
 
-def download_image(session: requests.Session, url: str, token: str) -> Path | None:
-    """Download an image and save it locally. Returns local path or None."""
-    local = image_local_path(url)
-    try:
-        # For same-domain images, use the session with auth
-        parsed = urlparse(url)
-        if "new-t.github.io" in parsed.netloc or not parsed.netloc:
-            resp = fetch_page(session, url, token)
-        else:
-            # External images usually don't need auth
-            resp = requests.get(url, headers=HEADERS, timeout=IMAGE_TIMEOUT)
+# ---------------------------------------------------------------------------
+# Image downloader
+# ---------------------------------------------------------------------------
+
+class ImageDownloader:
+    """Download and cache images locally."""
+
+    def __init__(self, images_dir: Path, token: str):
+        self.images_dir = images_dir
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.session.headers["User-Token"] = token
+        self.downloaded: dict[str, str] = {}  # url -> local path
+
+    def download(self, url: str) -> str | None:
+        """Download an image, return local path. Skips if already downloaded."""
+        if not url or url.startswith("data:"):
+            return None
+
+        if url in self.downloaded:
+            return self.downloaded[url]
+
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace(":", "_") or "local"
+            domain_dir = self.images_dir / safe_filename(domain)
+            domain_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build filename from URL path
+            path_part = unquote(parsed.path).strip("/")
+            if not path_part:
+                path_part = sha256(url.encode())[:16]
+            fname = safe_filename(path_part)
+
+            local_path = domain_dir / fname
+
+            # Skip if file exists and is non-empty
+            if local_path.exists() and local_path.stat().st_size > 0:
+                rel = str(local_path)
+                self.downloaded[url] = rel
+                return rel
+
+            resp = self.session.get(url, timeout=IMAGE_TIMEOUT)
             if resp.status_code != 200:
                 log.warning(f"Image download failed ({resp.status_code}): {url}")
                 return None
 
-        if resp is None:
-            return None
+            content = resp.content
+            if not content or len(content) < 50:
+                log.warning(f"Image too small or empty: {url}")
+                return None
 
-        content = resp.content
-        if not content or len(content) < 100:
-            log.warning(f"Image too small or empty: {url}")
-            return None
-
-        # Ensure the file has a proper extension
-        content_type = resp.headers.get("Content-Type", "")
-        ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) if content_type else None
-        if ext and not str(local).lower().endswith(ext):
-            # Only add extension if file doesn't already have one that makes sense
-            current_ext = local.suffix.lower()
+            # Fix extension based on content-type
+            content_type = resp.headers.get("Content-Type", "")
+            ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) if content_type else None
             image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif"}
-            if current_ext not in image_exts:
-                local = local.with_suffix(ext)
+            if ext and local_path.suffix.lower() not in image_exts:
+                local_path = local_path.with_suffix(ext)
 
-        local.write_bytes(content)
-        log.info(f"Saved image: {url} -> {local}")
-        return local
+            local_path.write_bytes(content)
+            rel = str(local_path)
+            self.downloaded[url] = rel
+            log.info(f"Saved image: {url} -> {rel}")
+            return rel
 
-    except Exception as e:
-        log.error(f"Error downloading image {url}: {e}")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Page parsing
-# ---------------------------------------------------------------------------
-
-def extract_all_links(soup: BeautifulSoup, base_url: str) -> list[str]:
-    """Extract all internal page links."""
-    links = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        full = urljoin(base_url, href)
-        parsed = urlparse(full)
-        # Only follow links within the same domain
-        if "new-t.github.io" in parsed.netloc:
-            # Remove fragment
-            clean = parsed._replace(fragment="").geturl()
-            links.add(clean)
-    return sorted(links)
-
-
-def extract_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
-    """Extract all image URLs from the page."""
-    urls = set()
-
-    # <img> tags
-    for img in soup.find_all("img", src=True):
-        urls.add(urljoin(base_url, img["src"]))
-    for img in soup.find_all("img", attrs={"data-src": True}):
-        urls.add(urljoin(base_url, img["data-src"]))
-
-    # <source> tags (picture elements)
-    for source in soup.find_all("source", srcset=True):
-        for part in source["srcset"].split(","):
-            src = part.strip().split()[0]
-            if src:
-                urls.add(urljoin(base_url, src))
-
-    # CSS background-image
-    for tag in soup.find_all(style=True):
-        style = tag["style"]
-        for match in re.findall(r'url\(["\']?(.*?)["\']?\)', style):
-            urls.add(urljoin(base_url, match))
-
-    # <style> blocks
-    for style_tag in soup.find_all("style"):
-        if style_tag.string:
-            for match in re.findall(r'url\(["\']?(.*?)["\']?\)', style_tag.string):
-                urls.add(urljoin(base_url, match))
-
-    # <link> with image rels (favicons, icons, etc.)
-    for link in soup.find_all("link", href=True):
-        rel = " ".join(link.get("rel", []))
-        if "icon" in rel or "image" in rel or "apple-touch" in rel:
-            urls.add(urljoin(base_url, link["href"]))
-
-    # Open Graph / Twitter card images
-    for meta in soup.find_all("meta"):
-        prop = meta.get("property", "") or meta.get("name", "")
-        content = meta.get("content", "")
-        if content and ("image" in prop.lower() or "og:image" in prop.lower()):
-            urls.add(urljoin(base_url, content))
-
-    # Inline style attributes on any element
-    for tag in soup.find_all(True):
-        style = tag.get("style", "")
-        if "url(" in style:
-            for match in re.findall(r'url\(["\']?(.*?)["\']?\)', style):
-                if match and not match.startswith("data:"):
-                    urls.add(urljoin(base_url, match))
-
-    # Filter out data URIs
-    urls = {u for u in urls if not u.startswith("data:")}
-
-    return sorted(urls)
-
-
-def extract_text_content(soup: BeautifulSoup) -> str:
-    """Extract clean text content from the page."""
-    # Remove script and style elements
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    return soup.get_text(separator="\n", strip=True)
-
-
-def extract_structured_content(soup: BeautifulSoup, base_url: str) -> dict:
-    """Extract structured content preserving hierarchy."""
-    data = {
-        "title": "",
-        "meta": {},
-        "headings": [],
-        "paragraphs": [],
-        "links": [],
-        "images": [],
-        "lists": [],
-        "tables": [],
-    }
-
-    # Title
-    title_tag = soup.find("title")
-    if title_tag:
-        data["title"] = title_tag.get_text(strip=True)
-
-    # Meta tags
-    for meta in soup.find_all("meta"):
-        name = meta.get("name") or meta.get("property") or ""
-        content = meta.get("content", "")
-        if name and content:
-            data["meta"][name] = content
-
-    # Headings
-    for level in range(1, 7):
-        for h in soup.find_all(f"h{level}"):
-            data["headings"].append({
-                "level": level,
-                "text": h.get_text(strip=True),
-            })
-
-    # Paragraphs
-    for p in soup.find_all("p"):
-        text = p.get_text(strip=True)
-        if text:
-            data["paragraphs"].append(text)
-
-    # Links
-    for a in soup.find_all("a", href=True):
-        data["links"].append({
-            "text": a.get_text(strip=True),
-            "href": urljoin(base_url, a["href"]),
-        })
-
-    # Images
-    for img in soup.find_all("img"):
-        data["images"].append({
-            "src": urljoin(base_url, img.get("src", "")),
-            "alt": img.get("alt", ""),
-            "title": img.get("title", ""),
-        })
-
-    # Lists
-    for ul in soup.find_all(["ul", "ol"]):
-        items = [li.get_text(strip=True) for li in ul.find_all("li", recursive=False)]
-        if items:
-            data["lists"].append({
-                "type": ul.name,
-                "items": items,
-            })
-
-    # Tables
-    for table in soup.find_all("table"):
-        rows = []
-        for tr in table.find_all("tr"):
-            cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-            if cells:
-                rows.append(cells)
-        if rows:
-            data["tables"].append(rows)
-
-    return data
+        except Exception as e:
+            log.error(f"Error downloading image {url}: {e}")
+            return None
 
 
 # ---------------------------------------------------------------------------
-# Core scraping logic
+# Scraper
 # ---------------------------------------------------------------------------
 
-def scrape_page(session: requests.Session, url: str, token: str,
-                visited: set, all_images: dict, depth: int = 0, max_depth: int = 5) -> dict | None:
-    """Scrape a single page and return its data."""
-    if url in visited or depth > max_depth:
-        return None
-    visited.add(url)
+class HoleScraper:
+    """Full scraper that archives all posts, comments, and images."""
 
-    log.info(f"Scraping: {url} (depth={depth})")
-    resp = fetch_page(session, url, token)
-    if resp is None:
-        log.error(f"Failed to fetch: {url}")
-        return None
+    def __init__(self, token: str, output_dir: Path, api_base: str = API_BASE):
+        self.output = output_dir
+        self.client = HoleClient(token, api_base)
+        self.img_dl = ImageDownloader(output_dir / "images", token)
+        self.posts_dir = output_dir / "posts"
+        self.history_dir = output_dir / "history"
+        ensure_dirs(output_dir)
 
-    html = resp.text
-    content_hash = sha256(html.encode())
+        # State tracking
+        self.all_posts_file = output_dir / "all_posts.json"
+        self.changelog_file = output_dir / "changelog.json"
+        self.state_file = output_dir / "scraper_state.json"
 
-    soup = BeautifulSoup(html, "lxml")
-
-    # Extract content
-    text_content = extract_text_content(BeautifulSoup(html, "lxml"))  # fresh copy
-    structured = extract_structured_content(soup, url)
-    image_urls = extract_image_urls(BeautifulSoup(html, "lxml"), url)
-    internal_links = extract_all_links(BeautifulSoup(html, "lxml"), url)
-
-    # Download images
-    downloaded_images = {}
-    for img_url in image_urls:
-        if img_url in all_images:
-            downloaded_images[img_url] = all_images[img_url]
-            continue
-        if is_allowed_image_domain(img_url):
-            local = download_image(session, img_url, token)
-            if local:
-                rel_path = str(local)
-                downloaded_images[img_url] = rel_path
-                all_images[img_url] = rel_path
-        else:
-            log.info(f"Skipping image from non-allowlisted domain: {img_url}")
-            # Still record the URL even if we don't download
-            downloaded_images[img_url] = f"[external, not downloaded] {img_url}"
-            all_images[img_url] = downloaded_images[img_url]
-
-    page_data = {
-        "url": url,
-        "fetched_at": now_iso(),
-        "content_hash": content_hash,
-        "title": structured["title"],
-        "text_content": text_content,
-        "structured_content": structured,
-        "images": downloaded_images,
-        "internal_links": internal_links,
-        "html_length": len(html),
-    }
-
-    # Save raw HTML
-    page_fname = safe_filename(url)
-    html_path = PAGES_DIR / f"{page_fname}.html"
-    html_path.write_text(html, encoding="utf-8")
-    page_data["saved_html"] = str(html_path)
-
-    # Save text content
-    txt_path = PAGES_DIR / f"{page_fname}.txt"
-    txt_path.write_text(text_content, encoding="utf-8")
-    page_data["saved_text"] = str(txt_path)
-
-    # Save structured JSON
-    json_path = PAGES_DIR / f"{page_fname}.json"
-    json_path.write_text(json.dumps(structured, ensure_ascii=False, indent=2), encoding="utf-8")
-    page_data["saved_json"] = str(json_path)
-
-    # Recursively scrape internal links
-    sub_pages = []
-    for link in internal_links:
-        sub = scrape_page(session, link, token, visited, all_images, depth + 1, max_depth)
-        if sub:
-            sub_pages.append(sub)
-    page_data["sub_pages"] = sub_pages
-
-    return page_data
-
-
-def detect_changes(new_snapshot: dict, old_snapshot: dict | None) -> list[dict]:
-    """Compare snapshots and return list of changes."""
-    changes = []
-    if old_snapshot is None:
-        changes.append({
-            "type": "initial_scrape",
-            "timestamp": now_iso(),
-            "detail": "First scrape - no previous data to compare",
-        })
-        return changes
-
-    def flatten_pages(snapshot, pages=None):
-        if pages is None:
-            pages = {}
-        if snapshot:
-            pages[snapshot["url"]] = snapshot["content_hash"]
-            for sub in snapshot.get("sub_pages", []):
-                flatten_pages(sub, pages)
-        return pages
-
-    old_pages = flatten_pages(old_snapshot)
-    new_pages = flatten_pages(new_snapshot)
-
-    for url, h in new_pages.items():
-        if url not in old_pages:
-            changes.append({
-                "type": "new_page",
-                "timestamp": now_iso(),
-                "url": url,
-            })
-        elif old_pages[url] != h:
-            changes.append({
-                "type": "content_changed",
-                "timestamp": now_iso(),
-                "url": url,
-                "old_hash": old_pages[url],
-                "new_hash": h,
-            })
-
-    for url in old_pages:
-        if url not in new_pages:
-            changes.append({
-                "type": "page_removed",
-                "timestamp": now_iso(),
-                "url": url,
-            })
-
-    return changes
-
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
-def run_once(token: str) -> dict | None:
-    """Run a single scrape cycle."""
-    ensure_dirs()
-    session = build_session(token)
-
-    visited: set[str] = set()
-    all_images: dict[str, str] = {}
-
-    log.info("=" * 60)
-    log.info(f"Starting scrape cycle at {now_iso()}")
-    log.info("=" * 60)
-
-    snapshot = scrape_page(session, BASE_URL, token, visited, all_images)
-    if snapshot is None:
-        log.error("Failed to scrape the main page.")
-        return None
-
-    # Load previous snapshot for comparison
-    old_snapshot = None
-    if SNAPSHOT_FILE.exists():
-        try:
-            old_snapshot = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # Detect changes
-    changes = detect_changes(snapshot, old_snapshot)
-    if changes:
-        for c in changes:
-            log.info(f"Change detected: {c['type']} - {c.get('url', c.get('detail', ''))}")
-
-        # Append to changelog
-        changelog = []
-        if CHANGE_LOG.exists():
+    def _load_state(self) -> dict:
+        if self.state_file.exists():
             try:
-                changelog = json.loads(CHANGE_LOG.read_text(encoding="utf-8"))
+                return json.loads(self.state_file.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 pass
-        changelog.extend(changes)
-        CHANGE_LOG.write_text(json.dumps(changelog, ensure_ascii=False, indent=2), encoding="utf-8")
-    else:
-        log.info("No changes detected since last scrape.")
+        return {"last_max_pid": 0, "total_posts": 0, "total_images": 0}
 
-    # Save snapshot
-    SNAPSHOT_FILE.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _save_state(self, state: dict):
+        self.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Save timestamped history copy
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    history_path = HISTORY_DIR / f"snapshot_{ts}.json"
-    history_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _extract_image_urls(self, post: dict) -> list[str]:
+        """Extract all image URLs from a post or comment."""
+        urls = []
+        text = post.get("text", "")
 
-    # Summary
-    def count_pages(s):
-        if s is None:
-            return 0
-        return 1 + sum(count_pages(sub) for sub in s.get("sub_pages", []))
+        # Markdown image syntax: ![alt](url)
+        for match in re.findall(r'!\[.*?\]\((.*?)\)', text):
+            urls.append(match)
 
-    total_pages = count_pages(snapshot)
-    total_images = len(all_images)
-    log.info(f"Scrape complete: {total_pages} pages, {total_images} images, {len(changes)} changes")
+        # HTML img tags in text
+        for match in re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', text):
+            urls.append(match)
 
-    return snapshot
+        # Direct image URL in text (common patterns)
+        for match in re.findall(r'(https?://[^\s<>"]+\.(?:png|jpg|jpeg|gif|webp|avif|svg|bmp)(?:\?[^\s<>"]*)?)', text, re.IGNORECASE):
+            urls.append(match)
 
+        # Risu.io specific patterns
+        for match in re.findall(r'(https?://[^\s<>"]*risu\.io[^\s<>"]*)', text, re.IGNORECASE):
+            if match not in urls:
+                urls.append(match)
 
-def run_loop(token: str, interval: int):
-    """Run scraping in a continuous loop."""
-    log.info(f"Starting continuous scraping (interval: {interval}s)")
-    log.info(f"Target: {BASE_URL}")
-    log.info(f"Output: {OUTPUT_DIR.resolve()}")
-    log.info(f"Press Ctrl+C to stop")
+        # Post-level image field (some backends store image URLs directly)
+        if post.get("url"):
+            urls.append(post["url"])
+        if post.get("image"):
+            urls.append(post["image"])
+        if post.get("image_url"):
+            urls.append(post["image_url"])
 
-    cycle = 0
-    while True:
-        cycle += 1
-        log.info(f"\n--- Cycle {cycle} ---")
-        try:
-            run_once(token)
-        except Exception as e:
-            log.error(f"Error in scrape cycle: {e}", exc_info=True)
+        return urls
 
-        log.info(f"Next scrape in {interval} seconds...")
-        try:
-            time.sleep(interval)
-        except KeyboardInterrupt:
-            log.info("Stopped by user.")
-            break
+    def _process_images(self, data: dict) -> dict[str, str]:
+        """Download all images found in a post/comment. Return url->local mapping."""
+        image_map = {}
+        for url in self._extract_image_urls(data):
+            local = self.img_dl.download(url)
+            if local:
+                image_map[url] = local
+            else:
+                image_map[url] = f"[failed] {url}"
+        return image_map
+
+    def _save_post(self, post: dict, comments: list | None, image_map: dict):
+        """Save a single post with its comments and image mapping."""
+        pid = post.get("pid", 0)
+        record = {
+            "post": post,
+            "comments": comments or [],
+            "images_downloaded": image_map,
+            "scraped_at": now_iso(),
+        }
+        path = self.posts_dir / f"post_{pid}.json"
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def scrape_all_posts(self) -> list[dict]:
+        """Fetch ALL posts by paginating through getlist."""
+        all_posts = []
+        page = 1
+        empty_pages = 0
+
+        log.info("Fetching all posts...")
+        while True:
+            result = self.client.get_list(page=page)
+            if result is None:
+                log.error(f"Failed to fetch page {page}, stopping pagination")
+                break
+
+            code = result.get("code", -1)
+            if code != 0:
+                log.warning(f"API returned code={code} on page {page}: {result.get('msg', '')}")
+                break
+
+            posts = result.get("data", [])
+            if not posts:
+                empty_pages += 1
+                if empty_pages >= 3:
+                    log.info(f"3 consecutive empty pages at page {page}, done.")
+                    break
+                page += 1
+                continue
+
+            empty_pages = 0
+            all_posts.extend(posts)
+            count = result.get("count", "?")
+            log.info(f"Page {page}: got {len(posts)} posts (total so far: {len(all_posts)}, server count: {count})")
+
+            page += 1
+            time.sleep(0.3)  # polite rate limiting
+
+        log.info(f"Fetched {len(all_posts)} posts total across {page - 1} pages")
+        return all_posts
+
+    def scrape_comments_for_post(self, pid: int) -> list[dict] | None:
+        """Fetch all comments for a post."""
+        result = self.client.get_comments(pid)
+        if result is None:
+            return None
+        if result.get("code", -1) != 0:
+            log.warning(f"Comments API error for pid={pid}: {result.get('msg', '')}")
+            return None
+        return result.get("data", [])
+
+    def run_full_scrape(self) -> dict:
+        """Run a complete scrape: all posts + comments + images."""
+        state = self._load_state()
+        ts = now_iso()
+        log.info("=" * 60)
+        log.info(f"Full scrape starting at {ts}")
+        log.info(f"Previous max PID: {state['last_max_pid']}")
+        log.info("=" * 60)
+
+        # 1. Fetch all posts
+        posts = self.scrape_all_posts()
+        if not posts:
+            log.error("No posts fetched.")
+            return {"error": "No posts fetched", "timestamp": ts}
+
+        new_max_pid = max(p.get("pid", 0) for p in posts)
+        new_posts_count = sum(1 for p in posts if p.get("pid", 0) > state["last_max_pid"])
+        log.info(f"New posts since last scrape: {new_posts_count}")
+        log.info(f"Max PID: {new_max_pid}")
+
+        # 2. For each post, fetch comments and download images
+        total_comments = 0
+        total_images = 0
+        all_records = []
+
+        for i, post in enumerate(posts):
+            pid = post.get("pid", 0)
+            if i % 50 == 0:
+                log.info(f"Processing post {i+1}/{len(posts)} (pid={pid})...")
+
+            # Download post images
+            image_map = self._process_images(post)
+            total_images += len([v for v in image_map.values() if not v.startswith("[failed]")])
+
+            # Fetch comments
+            comments = self.scrape_comments_for_post(pid)
+            if comments:
+                total_comments += len(comments)
+                # Download comment images
+                for comment in comments:
+                    comment_images = self._process_images(comment)
+                    image_map.update(comment_images)
+                    total_images += len([v for v in comment_images.values() if not v.startswith("[failed]")])
+
+            # Save individual post file
+            self._save_post(post, comments, image_map)
+
+            all_records.append({
+                "pid": pid,
+                "text_preview": post.get("text", "")[:100],
+                "n_comments": len(comments) if comments else 0,
+                "n_images": len(image_map),
+                "create_time": post.get("create_time", ""),
+            })
+
+            time.sleep(0.2)  # rate limiting
+
+        # 3. Save summary
+        summary = {
+            "scraped_at": ts,
+            "total_posts": len(posts),
+            "new_posts": new_posts_count,
+            "total_comments": total_comments,
+            "total_images_downloaded": total_images,
+            "max_pid": new_max_pid,
+            "posts_index": all_records,
+        }
+
+        # Save all posts JSON (full data)
+        self.all_posts_file.write_text(
+            json.dumps({"posts": posts, "scraped_at": ts}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # Save timestamped snapshot
+        ts_safe = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        history_file = self.history_dir / f"scrape_{ts_safe}.json"
+        history_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # Changelog
+        changes = []
+        if new_posts_count > 0:
+            changes.append({
+                "type": "new_posts",
+                "count": new_posts_count,
+                "timestamp": ts,
+                "max_pid": new_max_pid,
+            })
+        if changes:
+            changelog = []
+            if self.changelog_file.exists():
+                try:
+                    changelog = json.loads(self.changelog_file.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    pass
+            changelog.extend(changes)
+            self.changelog_file.write_text(
+                json.dumps(changelog, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+        # Update state
+        state["last_max_pid"] = new_max_pid
+        state["total_posts"] = len(posts)
+        state["total_images"] = total_images
+        state["last_scrape"] = ts
+        self._save_state(state)
+
+        log.info("=" * 60)
+        log.info(f"Scrape complete!")
+        log.info(f"  Posts: {len(posts)}")
+        log.info(f"  New posts: {new_posts_count}")
+        log.info(f"  Comments: {total_comments}")
+        log.info(f"  Images: {total_images}")
+        log.info("=" * 60)
+
+        return summary
+
+    def run_incremental(self) -> dict:
+        """Quick incremental scrape - only fetch recent pages until we hit known posts."""
+        state = self._load_state()
+        last_max = state["last_max_pid"]
+        ts = now_iso()
+
+        log.info(f"Incremental scrape (looking for posts after pid={last_max})")
+
+        new_posts = []
+        page = 1
+        found_old = False
+
+        while not found_old:
+            result = self.client.get_list(page=page)
+            if result is None or result.get("code", -1) != 0:
+                break
+
+            posts = result.get("data", [])
+            if not posts:
+                break
+
+            for post in posts:
+                pid = post.get("pid", 0)
+                if pid <= last_max:
+                    found_old = True
+                    break
+                new_posts.append(post)
+
+            page += 1
+            time.sleep(0.3)
+
+        if not new_posts:
+            log.info("No new posts found.")
+            return {"new_posts": 0, "timestamp": ts}
+
+        log.info(f"Found {len(new_posts)} new posts")
+
+        total_images = 0
+        for post in new_posts:
+            pid = post.get("pid", 0)
+            image_map = self._process_images(post)
+            total_images += len([v for v in image_map.values() if not v.startswith("[failed]")])
+
+            comments = self.scrape_comments_for_post(pid)
+            if comments:
+                for comment in comments:
+                    comment_images = self._process_images(comment)
+                    image_map.update(comment_images)
+                    total_images += len([v for v in comment_images.values() if not v.startswith("[failed]")])
+
+            self._save_post(post, comments, image_map)
+            time.sleep(0.2)
+
+        new_max = max(p.get("pid", 0) for p in new_posts)
+        state["last_max_pid"] = max(new_max, last_max)
+        state["last_scrape"] = ts
+        self._save_state(state)
+
+        log.info(f"Incremental scrape done: {len(new_posts)} new posts, {total_images} images")
+        return {"new_posts": len(new_posts), "images": total_images, "timestamp": ts}
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def apply_config(output: str, extra_domains: list[str]):
-    """Apply CLI overrides to module-level config."""
-    global OUTPUT_DIR, IMAGES_DIR, PAGES_DIR, HISTORY_DIR, SNAPSHOT_FILE, CHANGE_LOG
+def apply_config(output: str):
+    global OUTPUT_DIR
     OUTPUT_DIR = Path(output)
-    IMAGES_DIR = OUTPUT_DIR / "images"
-    PAGES_DIR = OUTPUT_DIR / "pages"
-    HISTORY_DIR = OUTPUT_DIR / "history"
-    SNAPSHOT_FILE = OUTPUT_DIR / "latest_snapshot.json"
-    CHANGE_LOG = OUTPUT_DIR / "changelog.json"
-    for domain in extra_domains:
-        IMAGE_DOMAINS_ALLOWLIST.append(domain.lower())
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape https://new-t.github.io/ and save content + images",
+        description="新T树洞 scraper - fetch all posts, comments, and images via API",
     )
     parser.add_argument(
         "--token", "-t",
         required=True,
-        help="Access token for the site",
+        help="User-Token for API authentication",
     )
     parser.add_argument(
         "--interval", "-i",
@@ -643,7 +553,12 @@ def main():
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Run a single scrape then exit",
+        help="Run a single full scrape then exit",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Force a full scrape even in continuous mode (default: first=full, then incremental)",
     )
     parser.add_argument(
         "--output", "-o",
@@ -652,27 +567,48 @@ def main():
         help="Output directory (default: scraped_data)",
     )
     parser.add_argument(
-        "--max-depth", "-d",
-        type=int,
-        default=5,
-        help="Max link-following depth (default: 5)",
-    )
-    parser.add_argument(
-        "--allow-domain",
-        action="append",
-        default=[],
-        help="Additional domains to download images from (can be used multiple times)",
+        "--api-base",
+        type=str,
+        default=API_BASE,
+        help=f"API base URL (default: {API_BASE})",
     )
 
     args = parser.parse_args()
-    apply_config(args.output, args.allow_domain)
+    apply_config(args.output)
+    output = Path(args.output)
+
+    scraper = HoleScraper(args.token, output, args.api_base)
 
     if args.once:
-        result = run_once(args.token)
-        if result is None:
+        result = scraper.run_full_scrape()
+        if "error" in result:
             sys.exit(1)
-    else:
-        run_loop(args.token, args.interval)
+        return
+
+    # Continuous mode
+    log.info(f"Starting continuous scraping (interval: {args.interval}s)")
+    log.info(f"API: {args.api_base}")
+    log.info(f"Output: {output.resolve()}")
+    log.info("Press Ctrl+C to stop")
+
+    cycle = 0
+    while True:
+        cycle += 1
+        log.info(f"\n--- Cycle {cycle} ---")
+        try:
+            if cycle == 1 or args.full:
+                scraper.run_full_scrape()
+            else:
+                scraper.run_incremental()
+        except Exception as e:
+            log.error(f"Error in scrape cycle: {e}", exc_info=True)
+
+        log.info(f"Next scrape in {args.interval} seconds...")
+        try:
+            time.sleep(args.interval)
+        except KeyboardInterrupt:
+            log.info("Stopped by user.")
+            break
 
 
 if __name__ == "__main__":
