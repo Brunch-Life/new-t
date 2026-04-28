@@ -7,6 +7,7 @@ Backend API: https://api.tholeapis.top/_api/v1/
 Auth: User-Token header
 """
 
+import os
 import re
 import sys
 import json
@@ -41,6 +42,8 @@ HEADERS = {
 
 REQUEST_TIMEOUT = 30
 IMAGE_TIMEOUT = 60
+MAX_PAGES = 10000
+MAX_CHANGELOG_ENTRIES = 500
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,9 +67,24 @@ def sha256(data: bytes) -> str:
 
 def safe_filename(name: str, max_len: int = 200) -> str:
     safe = re.sub(r'[^\w.\-]', '_', name)
+    if not safe or safe == '_' * len(safe):
+        safe = hashlib.md5(name.encode()).hexdigest()[:16]
     if len(safe) > max_len:
         safe = safe[:max_len - 17] + "_" + hashlib.md5(name.encode()).hexdigest()[:16]
     return safe
+
+
+def atomic_write_json(path: Path, data):
+    """Write JSON atomically via temp file + rename."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def normalize_image_url(url: str) -> str:
+    """Strip query params for dedup purposes."""
+    parsed = urlparse(url)
+    return parsed._replace(query="", fragment="").geturl()
 
 
 def ensure_dirs(base: Path):
@@ -98,7 +116,11 @@ class HoleClient:
             if resp.status_code != 200:
                 log.warning(f"GET {url} -> {resp.status_code}: {resp.text[:200]}")
                 return None
-            return resp.json()
+            data = resp.json()
+            if not isinstance(data, dict):
+                log.warning(f"Unexpected JSON type from {url}: {type(data).__name__}")
+                return None
+            return data
         except requests.RequestException as e:
             log.error(f"Request error GET {url}: {e}")
             return None
@@ -164,9 +186,10 @@ class ImageDownloader:
         if not url or url.startswith("data:"):
             return None
 
-        if url in self.seen:
+        norm = normalize_image_url(url)
+        if norm in self.seen:
             return None
-        self.seen.add(url)
+        self.seen.add(norm)
 
         try:
             parsed = urlparse(url)
@@ -181,6 +204,14 @@ class ImageDownloader:
 
             local_path = domain_dir / fname
 
+            # Also check with common image extensions
+            image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif"}
+            if local_path.suffix.lower() not in image_exts:
+                for ext in [".jpg", ".png", ".webp"]:
+                    alt = local_path.with_suffix(ext)
+                    if alt.exists() and alt.stat().st_size > 0:
+                        return str(alt)
+
             if local_path.exists() and local_path.stat().st_size > 0:
                 return str(local_path)
 
@@ -192,11 +223,9 @@ class ImageDownloader:
 
             content_type = resp.headers.get("Content-Type", "")
             ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) if content_type else None
-            image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif"}
             if ext and local_path.suffix.lower() not in image_exts:
                 local_path = local_path.with_suffix(ext)
 
-            # Stream to file to avoid holding full image in memory
             size = 0
             with open(local_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=65536):
@@ -245,7 +274,7 @@ class HoleScraper:
         return {"last_max_pid": 0, "total_posts": 0, "total_images": 0}
 
     def _save_state(self, state: dict):
-        self.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(self.state_file, state)
 
     def _extract_image_urls(self, post: dict) -> list[str]:
         """Extract all image URLs from a post or comment."""
@@ -302,7 +331,7 @@ class HoleScraper:
         """Yield posts one page at a time, without accumulating."""
         page = 1
         empty_pages = 0
-        while True:
+        while page <= MAX_PAGES:
             result = self.client.get_list(page=page)
             if result is None:
                 log.error(f"Failed to fetch page {page}, stopping pagination")
@@ -414,9 +443,9 @@ class HoleScraper:
                 "timestamp": ts,
                 "max_pid": max_pid,
             })
-            self.changelog_file.write_text(
-                json.dumps(changelog, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            if len(changelog) > MAX_CHANGELOG_ENTRIES:
+                changelog = changelog[-MAX_CHANGELOG_ENTRIES:]
+            atomic_write_json(self.changelog_file, changelog)
 
         state["last_max_pid"] = max_pid
         state["total_posts"] = total_posts
@@ -486,11 +515,6 @@ class HoleScraper:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def apply_config(output: str):
-    global OUTPUT_DIR
-    OUTPUT_DIR = Path(output)
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="新T树洞 scraper - fetch all posts, comments, and images via API",
@@ -530,7 +554,6 @@ def main():
     )
 
     args = parser.parse_args()
-    apply_config(args.output)
     output = Path(args.output)
 
     scraper = HoleScraper(args.token, output, args.api_base)
@@ -548,23 +571,22 @@ def main():
     log.info("Press Ctrl+C to stop")
 
     cycle = 0
-    while True:
-        cycle += 1
-        log.info(f"\n--- Cycle {cycle} ---")
-        try:
-            if cycle == 1 or args.full:
-                scraper.run_full_scrape()
-            else:
-                scraper.run_incremental()
-        except Exception as e:
-            log.error(f"Error in scrape cycle: {e}", exc_info=True)
+    try:
+        while True:
+            cycle += 1
+            log.info(f"\n--- Cycle {cycle} ---")
+            try:
+                if cycle == 1 or args.full:
+                    scraper.run_full_scrape()
+                else:
+                    scraper.run_incremental()
+            except Exception as e:
+                log.error(f"Error in scrape cycle: {e}", exc_info=True)
 
-        log.info(f"Next scrape in {args.interval} seconds...")
-        try:
+            log.info(f"Next scrape in {args.interval} seconds...")
             time.sleep(args.interval)
-        except KeyboardInterrupt:
-            log.info("Stopped by user.")
-            break
+    except KeyboardInterrupt:
+        log.info("Stopped by user.")
 
 
 if __name__ == "__main__":
