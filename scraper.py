@@ -7,7 +7,6 @@ Backend API: https://api.tholeapis.top/_api/v1/
 Auth: User-Token header
 """
 
-import os
 import re
 import sys
 import json
@@ -18,7 +17,7 @@ import argparse
 import mimetypes
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import urlparse, unquote
 
 import requests
 
@@ -155,15 +154,19 @@ class ImageDownloader:
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.session.headers["User-Token"] = token
-        self.downloaded: dict[str, str] = {}  # url -> local path
+        self.seen: set[str] = set()
+
+    def reset(self):
+        self.seen.clear()
 
     def download(self, url: str) -> str | None:
         """Download an image, return local path. Skips if already downloaded."""
         if not url or url.startswith("data:"):
             return None
 
-        if url in self.downloaded:
-            return self.downloaded[url]
+        if url in self.seen:
+            return None
+        self.seen.add(url)
 
         try:
             parsed = urlparse(url)
@@ -171,7 +174,6 @@ class ImageDownloader:
             domain_dir = self.images_dir / safe_filename(domain)
             domain_dir.mkdir(parents=True, exist_ok=True)
 
-            # Build filename from URL path
             path_part = unquote(parsed.path).strip("/")
             if not path_part:
                 path_part = sha256(url.encode())[:16]
@@ -179,34 +181,36 @@ class ImageDownloader:
 
             local_path = domain_dir / fname
 
-            # Skip if file exists and is non-empty
             if local_path.exists() and local_path.stat().st_size > 0:
-                rel = str(local_path)
-                self.downloaded[url] = rel
-                return rel
+                return str(local_path)
 
-            resp = self.session.get(url, timeout=IMAGE_TIMEOUT)
+            resp = self.session.get(url, timeout=IMAGE_TIMEOUT, stream=True)
             if resp.status_code != 200:
+                resp.close()
                 log.warning(f"Image download failed ({resp.status_code}): {url}")
                 return None
 
-            content = resp.content
-            if not content or len(content) < 50:
-                log.warning(f"Image too small or empty: {url}")
-                return None
-
-            # Fix extension based on content-type
             content_type = resp.headers.get("Content-Type", "")
             ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) if content_type else None
             image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif"}
             if ext and local_path.suffix.lower() not in image_exts:
                 local_path = local_path.with_suffix(ext)
 
-            local_path.write_bytes(content)
-            rel = str(local_path)
-            self.downloaded[url] = rel
-            log.info(f"Saved image: {url} -> {rel}")
-            return rel
+            # Stream to file to avoid holding full image in memory
+            size = 0
+            with open(local_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    f.write(chunk)
+                    size += len(chunk)
+            resp.close()
+
+            if size < 50:
+                local_path.unlink(missing_ok=True)
+                log.warning(f"Image too small ({size}B): {url}")
+                return None
+
+            log.info(f"Saved image: {url} -> {local_path}")
+            return str(local_path)
 
         except Exception as e:
             log.error(f"Error downloading image {url}: {e}")
@@ -229,7 +233,6 @@ class HoleScraper:
         ensure_dirs(output_dir)
 
         # State tracking
-        self.all_posts_file = output_dir / "all_posts.json"
         self.changelog_file = output_dir / "changelog.json"
         self.state_file = output_dir / "scraper_state.json"
 
@@ -276,47 +279,38 @@ class HoleScraper:
 
         return urls
 
-    def _process_images(self, data: dict) -> dict[str, str]:
-        """Download all images found in a post/comment. Return url->local mapping."""
-        image_map = {}
+    def _process_images(self, data: dict) -> int:
+        """Download all images found in a post/comment. Return count of successes."""
+        count = 0
         for url in self._extract_image_urls(data):
-            local = self.img_dl.download(url)
-            if local:
-                image_map[url] = local
-            else:
-                image_map[url] = f"[failed] {url}"
-        return image_map
+            if self.img_dl.download(url):
+                count += 1
+        return count
 
-    def _save_post(self, post: dict, comments: list | None, image_map: dict):
-        """Save a single post with its comments and image mapping."""
+    def _save_post(self, post: dict, comments: list | None):
+        """Save a single post with its comments."""
         pid = post.get("pid", 0)
         record = {
             "post": post,
             "comments": comments or [],
-            "images_downloaded": image_map,
             "scraped_at": now_iso(),
         }
         path = self.posts_dir / f"post_{pid}.json"
         path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def scrape_all_posts(self) -> list[dict]:
-        """Fetch ALL posts by paginating through getlist."""
-        all_posts = []
+    def _iter_pages(self):
+        """Yield posts one page at a time, without accumulating."""
         page = 1
         empty_pages = 0
-
-        log.info("Fetching all posts...")
         while True:
             result = self.client.get_list(page=page)
             if result is None:
                 log.error(f"Failed to fetch page {page}, stopping pagination")
                 break
-
             code = result.get("code", -1)
             if code != 0:
                 log.warning(f"API returned code={code} on page {page}: {result.get('msg', '')}")
                 break
-
             posts = result.get("data", [])
             if not posts:
                 empty_pages += 1
@@ -325,20 +319,14 @@ class HoleScraper:
                     break
                 page += 1
                 continue
-
             empty_pages = 0
-            all_posts.extend(posts)
             count = result.get("count", "?")
-            log.info(f"Page {page}: got {len(posts)} posts (total so far: {len(all_posts)}, server count: {count})")
-
+            log.info(f"Page {page}: got {len(posts)} posts (server count: {count})")
+            yield from posts
             page += 1
-            time.sleep(0.3)  # polite rate limiting
+            time.sleep(0.3)
 
-        log.info(f"Fetched {len(all_posts)} posts total across {page - 1} pages")
-        return all_posts
-
-    def scrape_comments_for_post(self, pid: int) -> list[dict] | None:
-        """Fetch all comments for a post."""
+    def _fetch_comments(self, pid: int) -> list[dict] | None:
         result = self.client.get_comments(pid)
         if result is None:
             return None
@@ -347,8 +335,24 @@ class HoleScraper:
             return None
         return result.get("data", [])
 
+    def _process_single_post(self, post: dict) -> tuple[int, int]:
+        """Fetch comments, download images, save to disk. Returns (n_comments, n_images)."""
+        pid = post.get("pid", 0)
+        n_images = self._process_images(post)
+
+        comments = self._fetch_comments(pid)
+        n_comments = 0
+        if comments:
+            n_comments = len(comments)
+            for comment in comments:
+                n_images += self._process_images(comment)
+
+        self._save_post(post, comments)
+        time.sleep(0.2)
+        return n_comments, n_images
+
     def run_full_scrape(self) -> dict:
-        """Run a complete scrape: all posts + comments + images."""
+        """Stream-process all posts: fetch page by page, process and discard."""
         state = self._load_state()
         ts = now_iso()
         log.info("=" * 60)
@@ -356,107 +360,73 @@ class HoleScraper:
         log.info(f"Previous max PID: {state['last_max_pid']}")
         log.info("=" * 60)
 
-        # 1. Fetch all posts
-        posts = self.scrape_all_posts()
-        if not posts:
+        self.img_dl.reset()
+
+        total_posts = 0
+        total_comments = 0
+        total_images = 0
+        new_posts_count = 0
+        max_pid = 0
+
+        # Stream posts: process each one and immediately discard
+        for post in self._iter_pages():
+            pid = post.get("pid", 0)
+            max_pid = max(max_pid, pid)
+            if pid > state["last_max_pid"]:
+                new_posts_count += 1
+
+            total_posts += 1
+            if total_posts % 50 == 0:
+                log.info(f"Processing post #{total_posts} (pid={pid})...")
+
+            n_comments, n_images = self._process_single_post(post)
+            total_comments += n_comments
+            total_images += n_images
+
+        if total_posts == 0:
             log.error("No posts fetched.")
             return {"error": "No posts fetched", "timestamp": ts}
 
-        new_max_pid = max(p.get("pid", 0) for p in posts)
-        new_posts_count = sum(1 for p in posts if p.get("pid", 0) > state["last_max_pid"])
-        log.info(f"New posts since last scrape: {new_posts_count}")
-        log.info(f"Max PID: {new_max_pid}")
-
-        # 2. For each post, fetch comments and download images
-        total_comments = 0
-        total_images = 0
-        all_records = []
-
-        for i, post in enumerate(posts):
-            pid = post.get("pid", 0)
-            if i % 50 == 0:
-                log.info(f"Processing post {i+1}/{len(posts)} (pid={pid})...")
-
-            # Download post images
-            image_map = self._process_images(post)
-            total_images += len([v for v in image_map.values() if not v.startswith("[failed]")])
-
-            # Fetch comments
-            comments = self.scrape_comments_for_post(pid)
-            if comments:
-                total_comments += len(comments)
-                # Download comment images
-                for comment in comments:
-                    comment_images = self._process_images(comment)
-                    image_map.update(comment_images)
-                    total_images += len([v for v in comment_images.values() if not v.startswith("[failed]")])
-
-            # Save individual post file
-            self._save_post(post, comments, image_map)
-
-            all_records.append({
-                "pid": pid,
-                "text_preview": post.get("text", "")[:100],
-                "n_comments": len(comments) if comments else 0,
-                "n_images": len(image_map),
-                "create_time": post.get("create_time", ""),
-            })
-
-            time.sleep(0.2)  # rate limiting
-
-        # 3. Save summary
+        # Save lightweight summary
         summary = {
             "scraped_at": ts,
-            "total_posts": len(posts),
+            "total_posts": total_posts,
             "new_posts": new_posts_count,
             "total_comments": total_comments,
             "total_images_downloaded": total_images,
-            "max_pid": new_max_pid,
-            "posts_index": all_records,
+            "max_pid": max_pid,
         }
 
-        # Save all posts JSON (full data)
-        self.all_posts_file.write_text(
-            json.dumps({"posts": posts, "scraped_at": ts}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        # Save timestamped snapshot
         ts_safe = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         history_file = self.history_dir / f"scrape_{ts_safe}.json"
         history_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # Changelog
-        changes = []
         if new_posts_count > 0:
-            changes.append({
-                "type": "new_posts",
-                "count": new_posts_count,
-                "timestamp": ts,
-                "max_pid": new_max_pid,
-            })
-        if changes:
             changelog = []
             if self.changelog_file.exists():
                 try:
                     changelog = json.loads(self.changelog_file.read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, OSError):
                     pass
-            changelog.extend(changes)
+            changelog.append({
+                "type": "new_posts",
+                "count": new_posts_count,
+                "timestamp": ts,
+                "max_pid": max_pid,
+            })
             self.changelog_file.write_text(
                 json.dumps(changelog, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
-        # Update state
-        state["last_max_pid"] = new_max_pid
-        state["total_posts"] = len(posts)
+        state["last_max_pid"] = max_pid
+        state["total_posts"] = total_posts
         state["total_images"] = total_images
         state["last_scrape"] = ts
         self._save_state(state)
 
         log.info("=" * 60)
         log.info(f"Scrape complete!")
-        log.info(f"  Posts: {len(posts)}")
+        log.info(f"  Posts: {total_posts}")
         log.info(f"  New posts: {new_posts_count}")
         log.info(f"  Comments: {total_comments}")
         log.info(f"  Images: {total_images}")
@@ -471,16 +441,18 @@ class HoleScraper:
         ts = now_iso()
 
         log.info(f"Incremental scrape (looking for posts after pid={last_max})")
+        self.img_dl.reset()
 
-        new_posts = []
+        new_count = 0
+        total_images = 0
+        new_max = last_max
+        done = False
         page = 1
-        found_old = False
 
-        while not found_old:
+        while not done:
             result = self.client.get_list(page=page)
             if result is None or result.get("code", -1) != 0:
                 break
-
             posts = result.get("data", [])
             if not posts:
                 break
@@ -488,42 +460,26 @@ class HoleScraper:
             for post in posts:
                 pid = post.get("pid", 0)
                 if pid <= last_max:
-                    found_old = True
+                    done = True
                     break
-                new_posts.append(post)
+                new_max = max(new_max, pid)
+                n_comments, n_images = self._process_single_post(post)
+                total_images += n_images
+                new_count += 1
 
             page += 1
             time.sleep(0.3)
 
-        if not new_posts:
+        if new_count == 0:
             log.info("No new posts found.")
             return {"new_posts": 0, "timestamp": ts}
 
-        log.info(f"Found {len(new_posts)} new posts")
-
-        total_images = 0
-        for post in new_posts:
-            pid = post.get("pid", 0)
-            image_map = self._process_images(post)
-            total_images += len([v for v in image_map.values() if not v.startswith("[failed]")])
-
-            comments = self.scrape_comments_for_post(pid)
-            if comments:
-                for comment in comments:
-                    comment_images = self._process_images(comment)
-                    image_map.update(comment_images)
-                    total_images += len([v for v in comment_images.values() if not v.startswith("[failed]")])
-
-            self._save_post(post, comments, image_map)
-            time.sleep(0.2)
-
-        new_max = max(p.get("pid", 0) for p in new_posts)
-        state["last_max_pid"] = max(new_max, last_max)
+        state["last_max_pid"] = new_max
         state["last_scrape"] = ts
         self._save_state(state)
 
-        log.info(f"Incremental scrape done: {len(new_posts)} new posts, {total_images} images")
-        return {"new_posts": len(new_posts), "images": total_images, "timestamp": ts}
+        log.info(f"Incremental scrape done: {new_count} new posts, {total_images} images")
+        return {"new_posts": new_count, "images": total_images, "timestamp": ts}
 
 
 # ---------------------------------------------------------------------------
