@@ -96,6 +96,10 @@ def ensure_dirs(base: Path):
 # API client
 # ---------------------------------------------------------------------------
 
+class TokenExpiredError(Exception):
+    pass
+
+
 class HoleClient:
     """Client for the 新T树洞 REST API."""
 
@@ -105,24 +109,33 @@ class HoleClient:
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.session.headers["User-Token"] = token
+        self._consecutive_errors = 0
 
     def _get(self, endpoint: str, params: dict | None = None) -> dict | None:
         url = f"{self.api_base}/{endpoint.lstrip('/')}"
         try:
             resp = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 401:
-                log.error(f"Token invalid or expired (401): {url}")
-                return None
+                raise TokenExpiredError(f"Token invalid or expired (401): {url}")
             if resp.status_code != 200:
+                self._consecutive_errors += 1
                 log.warning(f"GET {url} -> {resp.status_code}: {resp.text[:200]}")
+                if self._consecutive_errors >= 10:
+                    raise RuntimeError(f"Too many consecutive errors ({self._consecutive_errors}), aborting")
                 return None
+            self._consecutive_errors = 0
             data = resp.json()
             if not isinstance(data, dict):
                 log.warning(f"Unexpected JSON type from {url}: {type(data).__name__}")
                 return None
             return data
+        except (TokenExpiredError, RuntimeError):
+            raise
         except requests.RequestException as e:
+            self._consecutive_errors += 1
             log.error(f"Request error GET {url}: {e}")
+            if self._consecutive_errors >= 10:
+                raise RuntimeError(f"Too many consecutive errors ({self._consecutive_errors}), aborting")
             return None
         except ValueError as e:
             log.error(f"JSON decode error for {url}: {e}")
@@ -559,7 +572,11 @@ def main():
     scraper = HoleScraper(args.token, output, args.api_base)
 
     if args.once:
-        result = scraper.run_full_scrape()
+        try:
+            result = scraper.run_full_scrape()
+        except TokenExpiredError:
+            log.error("Token expired! Please provide a valid token.")
+            sys.exit(2)
         if "error" in result:
             sys.exit(1)
         return
@@ -571,6 +588,7 @@ def main():
     log.info("Press Ctrl+C to stop")
 
     cycle = 0
+    backoff = 0
     try:
         while True:
             cycle += 1
@@ -580,6 +598,18 @@ def main():
                     scraper.run_full_scrape()
                 else:
                     scraper.run_incremental()
+                backoff = 0
+            except TokenExpiredError:
+                log.error("Token expired! Waiting 1 hour before retry. "
+                          "Please update token or restart with a new one.")
+                time.sleep(3600)
+                continue
+            except RuntimeError as e:
+                backoff = min(backoff + 1, 5)
+                wait = args.interval * (2 ** backoff)
+                log.error(f"{e} — backing off {wait}s")
+                time.sleep(wait)
+                continue
             except Exception as e:
                 log.error(f"Error in scrape cycle: {e}", exc_info=True)
 
